@@ -446,6 +446,7 @@ def send_security_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header(
         "Content-Security-Policy",
         "default-src 'self'; "
+        "script-src 'self'; "
         "style-src 'self' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com; "
         "img-src 'self' data:; "
@@ -513,6 +514,7 @@ def layout(title: str, user: sqlite3.Row | None, content: str, active: str = "")
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>{document_title}</title>
         <link rel="stylesheet" href="/static/app.css">
+        <script src="/static/app.js" defer></script>
     </head>
     <body class="{"authenticated" if user else "guest"}">
         <div class="{shell_class}">
@@ -956,7 +958,9 @@ class ChirieHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/static/app.css":
-            return self.serve_static_css()
+            return self.serve_static("static/app.css", "text/css; charset=utf-8")
+        if path == "/static/app.js":
+            return self.serve_static("static/app.js", "application/javascript; charset=utf-8")
         if path.startswith("/attachments/"):
             return self.serve_attachment(path)
         if path == "/login":
@@ -1074,11 +1078,11 @@ class ChirieHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(raw, keep_blank_values=True)
         return {key: values[-1] for key, values in parsed.items()}, []
 
-    def serve_static_css(self) -> None:
-        path = Path("static/app.css")
+    def serve_static(self, file_path: str, content_type: str) -> None:
+        path = Path(file_path)
         if not path.exists():
             return self.not_found()
-        static_response(self, path.read_bytes(), "text/css; charset=utf-8")
+        static_response(self, path.read_bytes(), content_type)
 
     def serve_attachment(self, path: str) -> None:
         if not self.user:
@@ -1620,6 +1624,11 @@ class ChirieHandler(BaseHTTPRequestHandler):
             <p class="form-note">Normal gas and electricity readings must go upward. The previous reading is filled from the last recorded index or the tenancy start reading; if an invoice corrects an estimate, gives a credit, rolls over, or closes a tenancy, choose the matching reading type.</p>
             <label>Notes<textarea name="notes" rows="3">{esc(field("notes", ""))}</textarea></label>
             <label>Bill photos or PDFs<input name="bill_files" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf" multiple></label>
+            <div class="paste-upload" tabindex="0" data-paste-upload>
+                <strong>Paste screenshots here</strong>
+                <span>Click this area, then paste a screen clipping from your clipboard. Pasted images will be attached to the bill.</span>
+                <div class="paste-upload-list" data-paste-upload-list></div>
+            </div>
             <div class="existing-files">{attachment_links(entry["id"], "utility") if entry else ""}</div>
             <button type="submit">Save utility bill</button>
         </form>
@@ -1748,6 +1757,11 @@ class ChirieHandler(BaseHTTPRequestHandler):
             </div>
             <label>Notes<textarea name="notes" rows="3">{esc(charge["notes"] if charge else "")}</textarea></label>
             <label>Receipt or related file<input name="bill_files" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf" multiple></label>
+            <div class="paste-upload" tabindex="0" data-paste-upload>
+                <strong>Paste screenshots here</strong>
+                <span>Click this area, then paste a screen clipping from your clipboard. Pasted images will be attached to the charge.</span>
+                <div class="paste-upload-list" data-paste-upload-list></div>
+            </div>
             <div class="existing-files">{attachment_links(charge["id"], "charge") if charge else ""}</div>
             <button type="submit">Save charge</button>
         </form>
