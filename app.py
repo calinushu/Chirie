@@ -32,6 +32,9 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 SESSION_DAYS = int(os.getenv("SESSION_DAYS", "30"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "900"))
+LOGIN_MAX_IP_ATTEMPTS = int(os.getenv("LOGIN_MAX_IP_ATTEMPTS", "30"))
+LOGIN_MAX_ACCOUNT_ATTEMPTS = int(os.getenv("LOGIN_MAX_ACCOUNT_ATTEMPTS", "8"))
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 UTILITY_TYPES = {
     "electricity": "Electricity",
@@ -50,6 +53,7 @@ READING_MODES = {
     "correction": "Correction / credit",
     "final": "Final move-out reading",
 }
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -416,17 +420,39 @@ def ensure_recurring_rent(update_unpaid: bool = False) -> None:
 
 def redirect(handler: BaseHTTPRequestHandler, path: str) -> None:
     handler.send_response(HTTPStatus.SEE_OTHER)
+    send_security_headers(handler)
     handler.send_header("Location", path)
     handler.end_headers()
 
 
 def static_response(handler: BaseHTTPRequestHandler, content: bytes, content_type: str, status: int = 200) -> None:
     handler.send_response(status)
+    send_security_headers(handler)
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(content)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
     handler.wfile.write(content)
+
+
+def send_security_headers(handler: BaseHTTPRequestHandler) -> None:
+    handler.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("X-Frame-Options", "DENY")
+    handler.send_header("Referrer-Policy", "same-origin")
+    handler.send_header("Cross-Origin-Resource-Policy", "same-origin")
+    handler.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    handler.send_header(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "style-src 'self' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' data:; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "form-action 'self'",
+    )
 
 
 def make_cookie(name: str, value: str, max_age: int | None = None) -> str:
@@ -816,6 +842,34 @@ def create_session(user_id: int) -> tuple[str, str]:
     return token, csrf
 
 
+def prune_attempts(key: str, timestamp: float) -> list[float]:
+    attempts = [value for value in LOGIN_ATTEMPTS.get(key, []) if timestamp - value < LOGIN_WINDOW_SECONDS]
+    if attempts:
+        LOGIN_ATTEMPTS[key] = attempts
+    else:
+        LOGIN_ATTEMPTS.pop(key, None)
+    return attempts
+
+
+def login_limited(ip_address: str, email: str) -> bool:
+    timestamp = datetime.utcnow().timestamp()
+    ip_attempts = prune_attempts(f"ip:{ip_address}", timestamp)
+    account_attempts = prune_attempts(f"account:{ip_address}:{email.lower()}", timestamp)
+    return len(ip_attempts) >= LOGIN_MAX_IP_ATTEMPTS or len(account_attempts) >= LOGIN_MAX_ACCOUNT_ATTEMPTS
+
+
+def record_failed_login(ip_address: str, email: str) -> None:
+    timestamp = datetime.utcnow().timestamp()
+    for key in (f"ip:{ip_address}", f"account:{ip_address}:{email.lower()}"):
+        attempts = prune_attempts(key, timestamp)
+        attempts.append(timestamp)
+        LOGIN_ATTEMPTS[key] = attempts
+
+
+def clear_failed_login(ip_address: str, email: str) -> None:
+    LOGIN_ATTEMPTS.pop(f"account:{ip_address}:{email.lower()}", None)
+
+
 def require_admin(handler: "ChirieHandler") -> bool:
     if not handler.user:
         redirect(handler, "/login")
@@ -827,10 +881,21 @@ def require_admin(handler: "ChirieHandler") -> bool:
 
 
 class ChirieHandler(BaseHTTPRequestHandler):
+    server_version = "Chirie"
+    sys_version = ""
     user: sqlite3.Row | None = None
+
+    def version_string(self) -> str:
+        return self.server_version
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format_date_time(datetime.now().timestamp())} - {fmt % args}")
+
+    def client_ip(self) -> str:
+        forwarded_for = self.headers.get("X-Forwarded-For", "")
+        if forwarded_for:
+            return forwarded_for.split(",", 1)[0].strip()
+        return self.client_address[0]
 
     def do_GET(self) -> None:
         self.user = auth_user(self.headers)
@@ -985,6 +1050,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         content_type = row["content_type"] or mimetypes.guess_type(row["original_name"])[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
+        send_security_headers(self)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(stored.stat().st_size))
         self.send_header("Content-Disposition", f'inline; filename="{quote(row["original_name"])}"')
@@ -993,7 +1059,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
         with stored.open("rb") as handle:
             shutil.copyfileobj(handle, self.wfile)
 
-    def login_page(self, message: str = "") -> None:
+    def login_page(self, message: str = "", status: int = 200) -> None:
         if self.user:
             return redirect(self, "/dashboard")
         content = f"""
@@ -1021,16 +1087,22 @@ class ChirieHandler(BaseHTTPRequestHandler):
             </div>
         </section>
         """
-        static_response(self, layout("Sign in", None, content), "text/html; charset=utf-8")
+        static_response(self, layout("Sign in", None, content), "text/html; charset=utf-8", status)
 
     def login_post(self, fields: dict[str, str]) -> None:
         email = fields.get("email", "").strip()
         password = fields.get("password", "")
+        ip_address = self.client_ip()
+        if login_limited(ip_address, email):
+            return self.login_page("Too many login attempts. Please wait a few minutes before trying again.", HTTPStatus.TOO_MANY_REQUESTS)
         row = query_one("SELECT * FROM users WHERE email = ? AND active = 1", (email,))
         if not row or not verify_password(password, row["password_hash"]):
+            record_failed_login(ip_address, email)
             return self.login_page("Email or password is wrong.")
+        clear_failed_login(ip_address, email)
         token, _ = create_session(row["id"])
         self.send_response(HTTPStatus.SEE_OTHER)
+        send_security_headers(self)
         self.send_header("Location", "/dashboard")
         self.send_header("Set-Cookie", make_cookie("session", token, SESSION_DAYS * 86400))
         self.end_headers()
@@ -1040,6 +1112,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
         if "session" in cookie:
             execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(cookie["session"].value),))
         self.send_response(HTTPStatus.SEE_OTHER)
+        send_security_headers(self)
         self.send_header("Location", "/login")
         self.send_header("Set-Cookie", make_cookie("session", "", 0))
         self.end_headers()
