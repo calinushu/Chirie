@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+import warnings
+
+warnings.filterwarnings("ignore", message="'cgi' is deprecated.*", category=DeprecationWarning)
+
 import cgi
 import calendar
 import hashlib
