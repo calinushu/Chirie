@@ -1,5 +1,5 @@
 /* ──────────────────────────────────────────────────────────────
-   Chirie · 2026 redesign — drop-in replacement for static/app.css
+   Ceahlau 43 ap 2 · 2026 redesign - drop-in replacement for static/app.css
    Targets the existing class names emitted by app.py.
    No Python changes required.
    ────────────────────────────────────────────────────────────── */
@@ -105,6 +105,17 @@ button:disabled,
   color: #fff;
 }
 .secondary:hover { background: var(--accent-2); border-color: var(--accent-2); }
+
+.danger {
+  background: var(--warn-soft);
+  border-color: transparent;
+  color: var(--warn);
+}
+.danger:hover {
+  background: var(--warn);
+  border-color: var(--warn);
+  color: #fff;
+}
 
 .ghost {
   background: var(--paper);

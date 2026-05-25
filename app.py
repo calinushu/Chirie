@@ -24,7 +24,7 @@ from wsgiref.handlers import format_date_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-APP_NAME = os.getenv("APP_NAME", "Chirie")
+APP_NAME = os.getenv("APP_NAME", "Ceahlau 43 ap 2")
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DB_PATH = Path(os.getenv("DATABASE_PATH", DATA_DIR / "chirie.sqlite3"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", DATA_DIR / "uploads"))
@@ -637,6 +637,50 @@ def calculate_consumption(
     return current_value - previous_value, ""
 
 
+def readings_match(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return True
+    return abs(float(left) - float(right)) < 0.0001
+
+
+def expected_previous_reading(
+    utility_type: str,
+    tenancy_id: int | None = None,
+    before_date: str = "",
+    exclude_id: int | None = None,
+) -> float | None:
+    params: list[Any] = [utility_type]
+    filters = ["utility_type = ?", "current_reading IS NOT NULL"]
+    if exclude_id is not None:
+        filters.append("id != ?")
+        params.append(exclude_id)
+    if tenancy_id is not None:
+        filters.append("tenancy_id = ?")
+        params.append(tenancy_id)
+    if before_date:
+        filters.append("COALESCE(service_end, due_date, month || '-31') < ?")
+        params.append(before_date)
+    row = query_one(
+        f"""
+        SELECT current_reading
+        FROM utility_entries
+        WHERE {" AND ".join(filters)}
+        ORDER BY COALESCE(service_end, due_date, month || '-31') DESC, id DESC
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+    if row:
+        return float(row["current_reading"])
+    if tenancy_id is not None and utility_type in ("electricity", "gas"):
+        tenancy = query_one("SELECT * FROM tenancies WHERE id = ?", (tenancy_id,))
+        if tenancy:
+            column = "start_electricity" if utility_type == "electricity" else "start_gas"
+            if tenancy[column] is not None:
+                return float(tenancy[column])
+    return None
+
+
 def utility_card(entry: sqlite3.Row, user: sqlite3.Row) -> str:
     reading = "No reading"
     if entry["current_reading"] is not None:
@@ -660,6 +704,10 @@ def utility_card(entry: sqlite3.Row, user: sqlite3.Row) -> str:
             <button class="small" type="submit">Mark {"unpaid" if entry["paid"] else "paid"}</button>
         </form>
         <a class="button small ghost" href="/admin/utility/{entry["id"]}/edit">Edit</a>
+        <form method="post" action="/admin/utility/{entry["id"]}/delete">
+            {csrf_input(user)}
+            <button class="small danger" type="submit">Delete</button>
+        </form>
         """
     return f"""
     <article class="item-card">
@@ -697,6 +745,10 @@ def charge_card(charge: sqlite3.Row, user: sqlite3.Row) -> str:
             <button class="small" type="submit">Mark {"unpaid" if charge["paid"] else "paid"}</button>
         </form>
         {edit_link}
+        <form method="post" action="/admin/charge/{charge["id"]}/delete">
+            {csrf_input(user)}
+            <button class="small danger" type="submit">Delete</button>
+        </form>
         """
     service_period = ""
     if charge["service_start"] or charge["service_end"]:
@@ -960,12 +1012,16 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.save_utility(fields, files, path.split("/")[3])
         if path.startswith("/admin/utility/") and path.endswith("/toggle-paid"):
             return self.toggle_utility_paid(path.split("/")[3])
+        if path.startswith("/admin/utility/") and path.endswith("/delete"):
+            return self.delete_utility(path.split("/")[3])
         if path == "/admin/charge":
             return self.save_charge(fields, files)
         if path.startswith("/admin/charge/") and path.endswith("/edit"):
             return self.save_charge(fields, files, path.split("/")[3])
         if path.startswith("/admin/charge/") and path.endswith("/toggle-paid"):
             return self.toggle_charge_paid(path.split("/")[3])
+        if path.startswith("/admin/charge/") and path.endswith("/delete"):
+            return self.delete_charge(path.split("/")[3])
         self.not_found()
 
     def render(self, title: str, content: str, status: int = 200, active: str = "") -> None:
@@ -1067,13 +1123,13 @@ class ChirieHandler(BaseHTTPRequestHandler):
             <div class="login-panel">
                 <div class="login-copy">
                     <div class="login-brand"><span class="brand-mark large">C</span><strong>{esc(APP_NAME)}</strong></div>
-                    <p class="eyebrow">Private apartment ledger</p>
-                    <h1>Rent and bills without the monthly guessing game.</h1>
-                    <p>One tidy place for rent, utility readings, bill files, and payment status. Built for an admin and the tenants who need clarity.</p>
+                    <p class="eyebrow">Apartment rental management</p>
+                    <h1>Apartment rental management.</h1>
+                    <p>Rent, utilities, readings, tenant periods, bill files, and payment status for {esc(APP_NAME)}.</p>
                     <div class="login-proof">
                         <span>Readings</span>
-                        <span>Receipts</span>
-                        <span>Paid status</span>
+                        <span>Bills</span>
+                        <span>Tenancies</span>
                     </div>
                 </div>
                 <form class="login-card" method="post" action="/login">
@@ -1280,7 +1336,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
         """
         self.render("Tenancies", content, active="tenancies")
 
-    def tenancy_form(self, tenancy_id: str | None = None) -> None:
+    def tenancy_form(self, tenancy_id: str | None = None, error: str = "", values: dict[str, str] | None = None) -> None:
         if not require_admin(self):
             return
         tenancy = None
@@ -1288,8 +1344,14 @@ class ChirieHandler(BaseHTTPRequestHandler):
             tenancy = query_one("SELECT * FROM tenancies WHERE id = ?", (tenancy_id,))
             if not tenancy:
                 return self.not_found()
+        def field(name: str, default: Any = "") -> Any:
+            if values is not None and name in values:
+                return values[name]
+            if tenancy and name in tenancy.keys():
+                return tenancy[name]
+            return default
         tenant_users = query_all("SELECT * FROM users WHERE role = 'tenant' ORDER BY name")
-        selected_user = tenancy["user_id"] if tenancy else ""
+        selected_user = field("user_id", "")
         user_options = "".join(
             f'<option value="{user["id"]}" {"selected" if str(selected_user) == str(user["id"]) else ""}>{esc(user["name"])} · {esc(user["email"])}</option>'
             for user in tenant_users
@@ -1300,17 +1362,18 @@ class ChirieHandler(BaseHTTPRequestHandler):
         {page_header(title, "Use tenancy periods to split responsibility cleanly when people move in or out.")}
         <form class="panel wide-form" method="post" action="{action}">
             {csrf_input(self.user)}
+            {flash(error, "error") if error else ""}
             <div class="form-grid">
                 <label>Tenant<select name="user_id" required>{user_options}</select></label>
-                <label>Label<input name="label" value="{esc(tenancy["label"] if tenancy else "Current tenancy")}" required></label>
-                <label>Start date<input name="start_date" type="date" value="{esc(tenancy["start_date"] if tenancy else today())}" required></label>
-                <label>End date<input name="end_date" type="date" value="{esc(tenancy["end_date"] if tenancy else "")}"></label>
-                <label>Start electricity reading<input name="start_electricity" inputmode="decimal" value="{esc("" if not tenancy or tenancy["start_electricity"] is None else tenancy["start_electricity"])}"></label>
-                <label>End electricity reading<input name="end_electricity" inputmode="decimal" value="{esc("" if not tenancy or tenancy["end_electricity"] is None else tenancy["end_electricity"])}"></label>
-                <label>Start gas reading<input name="start_gas" inputmode="decimal" value="{esc("" if not tenancy or tenancy["start_gas"] is None else tenancy["start_gas"])}"></label>
-                <label>End gas reading<input name="end_gas" inputmode="decimal" value="{esc("" if not tenancy or tenancy["end_gas"] is None else tenancy["end_gas"])}"></label>
+                <label>Label<input name="label" value="{esc(field("label", "Current tenancy"))}" required></label>
+                <label>Start date<input name="start_date" type="date" value="{esc(field("start_date", today()))}" required></label>
+                <label>End date<input name="end_date" type="date" value="{esc(field("end_date", ""))}"></label>
+                <label>Start electricity reading<input name="start_electricity" inputmode="decimal" value="{esc("" if field("start_electricity", "") is None else field("start_electricity", ""))}"></label>
+                <label>End electricity reading<input name="end_electricity" inputmode="decimal" value="{esc("" if field("end_electricity", "") is None else field("end_electricity", ""))}"></label>
+                <label>Start gas reading<input name="start_gas" inputmode="decimal" value="{esc("" if field("start_gas", "") is None else field("start_gas", ""))}"></label>
+                <label>End gas reading<input name="end_gas" inputmode="decimal" value="{esc("" if field("end_gas", "") is None else field("end_gas", ""))}"></label>
             </div>
-            <label>Notes<textarea name="notes" rows="3">{esc(tenancy["notes"] if tenancy else "")}</textarea></label>
+            <label>Notes<textarea name="notes" rows="3">{esc(field("notes", ""))}</textarea></label>
             <button type="submit">Save tenancy</button>
         </form>
         """
@@ -1328,6 +1391,20 @@ class ChirieHandler(BaseHTTPRequestHandler):
         label = fields.get("label", "").strip() or "Tenancy"
         start_date = fields.get("start_date", today())
         end_date = fields.get("end_date", "")
+        if end_date and end_date < start_date:
+            return self.tenancy_form(tenancy_id, "End date cannot be before the start date.", fields)
+        overlap_params: list[Any] = [user_id, end_date or "9999-12-31", start_date]
+        overlap_sql = """
+            SELECT id FROM tenancies
+            WHERE user_id = ?
+              AND start_date <= ?
+              AND COALESCE(NULLIF(end_date, ''), '9999-12-31') >= ?
+        """
+        if parsed_id:
+            overlap_sql += " AND id != ?"
+            overlap_params.append(parsed_id)
+        if query_one(overlap_sql, tuple(overlap_params)):
+            return self.tenancy_form(tenancy_id, "This tenant already has an overlapping tenancy period.", fields)
         values = (
             user_id,
             label,
@@ -1496,8 +1573,21 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 return entry[name]
             return default
         default_start, default_end = month_bounds(str(field("month", current_month())))
+        default_tenancy = field("tenancy_id", "")
+        if default_tenancy in ("", None):
+            active = active_tenancy_for_date(default_end)
+            default_tenancy = active["id"] if active else ""
+        selected_utility = str(field("utility_type", "electricity"))
+        default_previous = field("previous_reading", "")
+        if default_previous in ("", None):
+            default_previous = expected_previous_reading(
+                selected_utility,
+                parse_int(default_tenancy),
+                str(field("service_start", default_start)),
+                parse_int(entry_id),
+            )
         utility_options = "".join(
-            f'<option value="{key}" {"selected" if str(field("utility_type", "electricity")) == key else ""}>{esc(label)}</option>'
+            f'<option value="{key}" {"selected" if selected_utility == key else ""}>{esc(label)}</option>'
             for key, label in UTILITY_TYPES.items()
         )
         mode_options = "".join(
@@ -1513,19 +1603,19 @@ class ChirieHandler(BaseHTTPRequestHandler):
             {flash(error, "error") if error else ""}
             <div class="form-grid">
                 <label>Type<select name="utility_type">{utility_options}</select></label>
-                <label>Tenant period<select name="tenancy_id">{tenancy_options(field("tenancy_id", ""))}</select></label>
+                <label>Tenant period<select name="tenancy_id">{tenancy_options(default_tenancy)}</select></label>
                 <label>Month<input name="month" type="month" value="{esc(field("month", current_month()))}" required></label>
                 <label>Invoice from<input name="service_start" type="date" value="{esc(field("service_start", default_start))}"></label>
                 <label>Invoice to<input name="service_end" type="date" value="{esc(field("service_end", default_end))}"></label>
                 <label>Reading type<select name="reading_mode">{mode_options}</select></label>
-                <label>Previous reading<input name="previous_reading" inputmode="decimal" value="{esc("" if field("previous_reading", "") is None else field("previous_reading", ""))}"></label>
+                <label>Previous reading<input name="previous_reading" inputmode="decimal" value="{esc("" if default_previous is None else default_previous)}"></label>
                 <label>Current reading<input name="current_reading" inputmode="decimal" value="{esc("" if field("current_reading", "") is None else field("current_reading", ""))}"></label>
                 <label>Rollover value<input name="rollover_limit" inputmode="decimal" value="{esc("" if field("rollover_limit", "") is None else field("rollover_limit", ""))}" placeholder="Example: 99999"></label>
                 <label>Invoice adjustment / credit (RON)<input name="adjustment_amount" inputmode="decimal" value="{esc(field("adjustment_amount", "0"))}"></label>
                 <label>Bill amount (RON)<input name="bill_amount" inputmode="decimal" value="{esc(field("bill_amount", ""))}" required></label>
                 <label>Due date<input name="due_date" type="date" value="{esc(field("due_date", today()))}"></label>
             </div>
-            <p class="form-note">Normal gas and electricity readings must go upward. If an invoice corrects an estimate, gives a credit, rolls over, or closes a tenancy, choose the matching reading type.</p>
+            <p class="form-note">Normal gas and electricity readings must go upward. The previous reading is filled from the last recorded index or the tenancy start reading; if an invoice corrects an estimate, gives a credit, rolls over, or closes a tenancy, choose the matching reading type.</p>
             <label>Notes<textarea name="notes" rows="3">{esc(field("notes", ""))}</textarea></label>
             <label>Bill photos or PDFs<input name="bill_files" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf" multiple></label>
             <div class="existing-files">{attachment_links(entry["id"], "utility") if entry else ""}</div>
@@ -1555,6 +1645,21 @@ class ChirieHandler(BaseHTTPRequestHandler):
         current = fields.get("current_reading", "")
         previous_value = None if previous == "" else parse_float(previous)
         current_value = None if current == "" else parse_float(current)
+        expected_previous = expected_previous_reading(utility_type, tenancy_id, service_start, parsed_entry_id)
+        if previous_value is None and expected_previous is not None:
+            previous_value = expected_previous
+        if (
+            utility_type in ("electricity", "gas")
+            and reading_mode in ("actual", "rollover", "final")
+            and expected_previous is not None
+            and not readings_match(previous_value, expected_previous)
+        ):
+            fields["previous_reading"] = "" if previous_value is None else f"{previous_value:g}"
+            return self.utility_form(
+                entry_id,
+                f"Previous reading should match the last known index ({expected_previous:g}) for this meter. Use Correction / credit if this invoice intentionally breaks the chain.",
+                fields,
+            )
         rollover_limit = None if fields.get("rollover_limit", "") == "" else parse_float(fields.get("rollover_limit"))
         consumption, validation_error = calculate_consumption(utility_type, previous_value, current_value, reading_mode, rollover_limit)
         if validation_error:
@@ -1598,6 +1703,16 @@ class ChirieHandler(BaseHTTPRequestHandler):
             "UPDATE utility_entries SET paid = CASE paid WHEN 1 THEN 0 ELSE 1 END, paid_at = CASE paid WHEN 1 THEN NULL ELSE ? END, updated_at = ? WHERE id = ?",
             (now_iso(), now_iso(), parsed_entry_id),
         )
+        redirect(self, "/dashboard")
+
+    def delete_utility(self, entry_id: str) -> None:
+        if not require_admin(self):
+            return
+        parsed_entry_id = parse_int(entry_id)
+        if parsed_entry_id is None:
+            return self.not_found()
+        self.delete_attached_files("utility_entry_id", parsed_entry_id)
+        execute("DELETE FROM utility_entries WHERE id = ?", (parsed_entry_id,))
         redirect(self, "/dashboard")
 
     def charge_form(self, charge_id: str | None = None) -> None:
@@ -1686,6 +1801,26 @@ class ChirieHandler(BaseHTTPRequestHandler):
             (now_iso(), now_iso(), parsed_charge_id),
         )
         redirect(self, "/dashboard")
+
+    def delete_charge(self, charge_id: str) -> None:
+        if not require_admin(self):
+            return
+        parsed_charge_id = parse_int(charge_id)
+        if parsed_charge_id is None:
+            return self.not_found()
+        self.delete_attached_files("charge_id", parsed_charge_id)
+        execute("DELETE FROM charges WHERE id = ?", (parsed_charge_id,))
+        redirect(self, "/dashboard")
+
+    def delete_attached_files(self, column: str, row_id: int) -> None:
+        if column not in ("utility_entry_id", "charge_id"):
+            return
+        files = query_all(f"SELECT stored_name FROM attachments WHERE {column} = ?", (row_id,))
+        for file in files:
+            try:
+                (UPLOAD_DIR / file["stored_name"]).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def save_files(self, files: list[dict[str, Any]], utility_entry_id: int | None = None, charge_id: int | None = None) -> None:
         for upload in files:

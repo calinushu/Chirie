@@ -4,7 +4,7 @@ services:
     container_name: chirie
     restart: unless-stopped
     environment:
-      APP_NAME: Chirie
+      APP_NAME: Ceahlau 43 ap 2
       ADMIN_NAME: Apartment Admin
       ADMIN_EMAIL: admin@example.com
       ADMIN_PASSWORD: ChangeMe123!
