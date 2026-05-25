@@ -1,4 +1,4 @@
-# Chirie
+# Ceahlau 43/2
 
 A small private expense tracker for a rented apartment. It uses Python standard library + SQLite, so deployment is simple and there are no paid services or external dependencies.
 
@@ -43,7 +43,8 @@ The app listens on port `8000`.
 Use this repository as a Docker Compose app. Set these environment variables in Coolify:
 
 ```env
-APP_NAME=Ceahlau 43 ap 2
+APP_NAME=Ceahlau 43/2
+APARTMENT_NAME=Ceahlau 43/2
 ADMIN_NAME=Your Name
 ADMIN_EMAIL=you@example.com
 ADMIN_PASSWORD=use-a-long-random-password

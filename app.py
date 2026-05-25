@@ -24,7 +24,8 @@ from wsgiref.handlers import format_date_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-APP_NAME = os.getenv("APP_NAME", "Ceahlau 43 ap 2")
+APARTMENT_NAME = os.getenv("APARTMENT_NAME", "Ceahlau 43/2")
+APP_NAME = os.getenv("APP_NAME", APARTMENT_NAME)
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DB_PATH = Path(os.getenv("DATABASE_PATH", DATA_DIR / "chirie.sqlite3"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", DATA_DIR / "uploads"))
@@ -492,8 +493,8 @@ def layout(title: str, user: sqlite3.Row | None, content: str, active: str = "")
         nav = f"""
         <aside class="sidebar">
             <a class="brand" href="/dashboard">
-                <span class="brand-mark">C</span>
-                <span><strong>{esc(APP_NAME)}</strong><small>apartment costs</small></span>
+                <span class="brand-mark">43</span>
+                <span><strong>{esc(APARTMENT_NAME)}</strong><small>rental management</small></span>
             </a>
             <nav>{nav_links}</nav>
             <form method="post" action="/logout" class="logout">
@@ -504,12 +505,13 @@ def layout(title: str, user: sqlite3.Row | None, content: str, active: str = "")
         """
     shell_class = "app-shell" if user else "guest-shell"
     main_class = "main" if user else "guest-main"
+    document_title = esc(APARTMENT_NAME if title == APARTMENT_NAME else f"{title} · {APARTMENT_NAME}")
     html_doc = f"""<!doctype html>
     <html lang="en">
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>{esc(title)} · {esc(APP_NAME)}</title>
+        <title>{document_title}</title>
         <link rel="stylesheet" href="/static/app.css">
     </head>
     <body class="{"authenticated" if user else "guest"}">
@@ -567,7 +569,7 @@ def page_header(title: str, subtitle: str, actions: str = "") -> str:
     return f"""
     <header class="page-header">
         <div>
-            <p class="eyebrow">{esc(APP_NAME)}</p>
+            <p class="eyebrow">{esc(APARTMENT_NAME)}</p>
             <h1>{esc(title)}</h1>
             <p>{esc(subtitle)}</p>
         </div>
@@ -933,7 +935,7 @@ def require_admin(handler: "ChirieHandler") -> bool:
 
 
 class ChirieHandler(BaseHTTPRequestHandler):
-    server_version = "Chirie"
+    server_version = "CeahlauRental"
     sys_version = ""
     user: sqlite3.Row | None = None
 
@@ -1122,10 +1124,10 @@ class ChirieHandler(BaseHTTPRequestHandler):
         <section class="login-wrap">
             <div class="login-panel">
                 <div class="login-copy">
-                    <div class="login-brand"><span class="brand-mark large">C</span><strong>{esc(APP_NAME)}</strong></div>
+                    <div class="login-brand"><span class="brand-mark large">43</span><strong>{esc(APARTMENT_NAME)}</strong></div>
                     <p class="eyebrow">Apartment rental management</p>
                     <h1>Apartment rental management.</h1>
-                    <p>Rent, utilities, readings, tenant periods, bill files, and payment status for {esc(APP_NAME)}.</p>
+                    <p>Rent, utilities, readings, tenant periods, bill files, and payment status for {esc(APARTMENT_NAME)}.</p>
                     <div class="login-proof">
                         <span>Readings</span>
                         <span>Bills</span>
@@ -1212,7 +1214,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
         rent_amount = parse_float(get_setting("rent_amount", "0"), 0)
         rent_due_day = parse_int(get_setting("rent_due_day", "1")) or 1
         content = f"""
-        {page_header("Dashboard", "A clean monthly view of what is owed, what is recorded, and how utilities are moving.", actions)}
+        {page_header(APARTMENT_NAME, "A clean monthly view of what is owed, what is recorded, and how utilities are moving.", actions)}
         <section class="stats-grid">
             <div class="stat"><span>Currently due</span><strong>{money(total_due)}</strong><small>Rent + utilities awaiting payment</small></div>
             <div class="stat"><span>Paid total</span><strong>{money(paid_total)}</strong><small>All recorded paid entries</small></div>
@@ -1233,7 +1235,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             <div class="insights-grid">{utility_insight_cards(self.user)}</div>
         </section>
         """
-        self.render("Dashboard", content, active="dashboard")
+        self.render(APARTMENT_NAME, content, active="dashboard")
 
     def history(self) -> None:
         tenancy_ids = visible_tenancy_ids(self.user)
