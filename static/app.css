@@ -996,9 +996,349 @@ code {
 }
 
 @media (max-width: 560px) {
+  body {
+    font-size: 16px;
+    line-height: 1.45;
+  }
+
+  button,
+  .button {
+    min-height: 46px;
+    padding: 11px 14px;
+    border-radius: 10px;
+    font-size: 15px;
+  }
+
+  .small {
+    min-height: 40px;
+    padding: 8px 12px;
+    font-size: 14px;
+  }
+
+  .app-shell {
+    display: block;
+  }
+
+  .sidebar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    gap: 12px;
+    padding: 12px 12px 10px;
+    background: rgba(250, 250, 247, 0.96);
+    backdrop-filter: blur(12px);
+  }
+
+  .brand {
+    padding: 0;
+  }
+
+  .brand strong {
+    font-size: 16px;
+  }
+
+  .brand small {
+    font-size: 12px;
+  }
+
+  .brand-mark {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    font-size: 15px;
+  }
+
+  nav {
+    display: flex;
+    flex-direction: row;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 2px 0 4px;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .nav-link {
+    flex: 0 0 auto;
+    min-height: 40px;
+    display: inline-flex;
+    align-items: center;
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    background: var(--paper);
+    color: var(--ink-2);
+    font-size: 14px;
+    white-space: nowrap;
+  }
+
+  .nav-link.active {
+    background: var(--ink);
+    color: var(--paper);
+    border-color: var(--ink);
+  }
+
+  .logout {
+    display: none;
+  }
+
+  .main {
+    padding: 18px 12px 48px;
+  }
+
+  .page-header {
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+
+  .page-header h1 {
+    font-size: 31px;
+    line-height: 1.02;
+  }
+
+  .page-header p {
+    font-size: 15px;
+    line-height: 1.45;
+  }
+
+  .eyebrow {
+    font-size: 11px;
+  }
+
+  .header-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .header-actions .button,
+  .header-actions button {
+    width: 100%;
+  }
+
+  .stats-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+
+  .stat {
+    padding: 16px;
+  }
+
+  .stat strong {
+    font-size: 32px;
+  }
+
+  .stat span,
+  .stat small {
+    font-size: 13px;
+  }
+
+  .section-block {
+    margin-top: 24px;
+  }
+
+  .section-title {
+    gap: 4px;
+    margin-bottom: 10px;
+  }
+
+  .section-title h2,
+  .panel h2,
+  .login-card h2 {
+    font-size: 20px;
+  }
+
+  .section-title p {
+    font-size: 14px;
+  }
+
+  .dashboard-grid {
+    gap: 18px;
+  }
+
+  .month-panel {
+    padding: 14px;
+  }
+
+  .cards-grid,
+  .due-grid,
+  .insights-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .item-card,
+  .insight-card,
+  .panel {
+    padding: 16px;
+    border-radius: 14px;
+  }
+
+  .item-top h3 {
+    font-size: 17px;
+  }
+
+  .item-top p {
+    font-size: 14px;
+  }
+
+  .pill,
+  .tenant-chip {
+    min-height: 26px;
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+
   .form-grid,
   .compact-list,
   .mini-list .compact-list {
     grid-template-columns: 1fr;
+  }
+
+  .compact-list {
+    gap: 10px;
+    margin: 12px 0;
+  }
+
+  dt {
+    font-size: 12px;
+  }
+
+  dd {
+    font-size: 15px;
+  }
+
+  .meta-line,
+  .files,
+  .card-actions,
+  .payment-summary {
+    font-size: 13px;
+  }
+
+  .card-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .card-actions form,
+  .card-actions .button,
+  .card-actions button {
+    width: 100%;
+  }
+
+  .payment-form {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .payment-form input {
+    width: 100%;
+    min-height: 42px;
+    font-size: 15px;
+  }
+
+  .payment-form button {
+    grid-column: 1 / -1;
+  }
+
+  form label {
+    font-size: 13px;
+    gap: 7px;
+  }
+
+  input,
+  select,
+  textarea {
+    min-height: 46px;
+    padding: 11px 12px;
+    border-radius: 10px;
+    font-size: 16px;
+  }
+
+  input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+    min-height: 20px;
+  }
+
+  .form-note {
+    font-size: 14px;
+  }
+
+  .paste-upload {
+    padding: 16px;
+    border-radius: 12px;
+  }
+
+  .paste-upload strong {
+    font-size: 15px;
+  }
+
+  .paste-upload span {
+    font-size: 14px;
+  }
+
+  .file-link {
+    min-height: 36px;
+    padding: 7px 10px;
+    font-size: 13px;
+  }
+
+  .table-wrap {
+    margin-inline: -12px;
+    border-inline: 0;
+    border-radius: 0;
+  }
+
+  table {
+    min-width: 720px;
+  }
+
+  th,
+  td {
+    padding: 12px;
+    font-size: 14px;
+  }
+
+  th {
+    font-size: 11px;
+  }
+
+  .login-wrap {
+    align-items: stretch;
+    padding: 12px;
+  }
+
+  .login-panel {
+    min-height: calc(100svh - 24px);
+    border-radius: 16px;
+  }
+
+  .login-copy,
+  .login-card {
+    padding: 24px 18px;
+  }
+
+  .login-copy h1 {
+    max-width: none;
+    font-size: 36px;
+  }
+
+  .login-copy p {
+    max-width: none;
+    font-size: 15px;
+  }
+
+  .login-proof span {
+    font-size: 13px;
+    padding: 6px 10px;
   }
 }
