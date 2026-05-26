@@ -348,6 +348,35 @@ def month_bounds(month: str) -> tuple[str, str]:
         return value, value
 
 
+def month_from_date(date_value: str) -> str:
+    try:
+        return datetime.strptime(date_value, "%Y-%m-%d").strftime("%Y-%m")
+    except ValueError:
+        if len(date_value or "") >= 7:
+            return date_value[:7]
+        return current_month()
+
+
+def add_month(month: str) -> str:
+    year, month_number = (int(part) for part in month.split("-", 1))
+    month_number += 1
+    if month_number > 12:
+        year += 1
+        month_number = 1
+    return f"{year:04d}-{month_number:02d}"
+
+
+def months_between(start_date: str, end_date: str) -> list[str]:
+    start_month = month_from_date(start_date)
+    end_month = month_from_date(end_date)
+    months = []
+    month = start_month
+    while month <= end_month:
+        months.append(month)
+        month = add_month(month)
+    return months
+
+
 def active_tenancy_for_date(date_value: str) -> sqlite3.Row | None:
     return query_one(
         """
@@ -394,20 +423,47 @@ def ensure_recurring_rent(update_unpaid: bool = False) -> None:
     if amount <= 0:
         return
     due_day = parse_int(get_setting("rent_due_day", "1")) or 1
-    month = current_month()
+    tenancies = query_all("SELECT * FROM tenancies ORDER BY start_date ASC, id ASC")
+    if not tenancies:
+        ensure_rent_for_month(None, current_month(), amount, due_day, update_unpaid)
+        return
+    for tenancy in tenancies:
+        end_date = tenancy["end_date"] or today()
+        if end_date > today():
+            end_date = today()
+        if end_date < tenancy["start_date"]:
+            continue
+        for month in months_between(tenancy["start_date"], end_date):
+            ensure_rent_for_month(int(tenancy["id"]), month, amount, due_day, update_unpaid)
+
+
+def ensure_rent_for_month(tenancy_id: int | None, month: str, amount: float, due_day: int, update_unpaid: bool = False) -> None:
     due_date = due_date_for_month(month, due_day)
     service_start, service_end = month_bounds(month)
-    tenancy = active_tenancy_for_date(due_date)
-    tenancy_id = tenancy["id"] if tenancy else None
     if tenancy_id is None:
         existing = query_one("SELECT * FROM charges WHERE charge_type = 'rent' AND month = ? AND tenancy_id IS NULL ORDER BY id LIMIT 1", (month,))
     else:
         existing = query_one("SELECT * FROM charges WHERE charge_type = 'rent' AND month = ? AND tenancy_id = ? ORDER BY id LIMIT 1", (month, tenancy_id))
+        if not existing:
+            existing = query_one(
+                """
+                SELECT * FROM charges
+                WHERE charge_type = 'rent' AND month = ? AND tenancy_id IS NULL
+                ORDER BY paid ASC, id ASC
+                LIMIT 1
+                """,
+                (month,),
+            )
     if existing:
         if update_unpaid and not existing["paid"]:
             execute(
                 "UPDATE charges SET title = 'Rent', amount = ?, due_date = ?, service_start = ?, service_end = ?, tenancy_id = ?, updated_at = ? WHERE id = ?",
                 (amount, due_date, service_start, service_end, tenancy_id, now_iso(), existing["id"]),
+            )
+        elif tenancy_id is not None and existing["tenancy_id"] is None:
+            execute(
+                "UPDATE charges SET tenancy_id = ?, service_start = ?, service_end = ?, updated_at = ? WHERE id = ?",
+                (tenancy_id, service_start, service_end, now_iso(), existing["id"]),
             )
         return
     execute(
@@ -1502,7 +1558,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
         <section class="two-column settings-layout">
             <form class="panel" method="post" action="/admin/settings">
                 <h2>Recurring rent</h2>
-                <p class="form-note">This creates one rent item for the current month automatically. After you mark it paid, next month's rent will appear as a fresh due item.</p>
+                <p class="form-note">This creates monthly rent items from each tenancy start date through its end date, or through the current month for active tenancies. Existing paid rent stays untouched.</p>
                 {csrf_input(self.user)}
                 <label>Monthly rent (RON)<input name="rent_amount" inputmode="decimal" value="{esc(rent_amount)}" required></label>
                 <label>Due day of month<input name="rent_due_day" type="number" min="1" max="31" value="{esc(rent_due_day)}" required></label>
@@ -1512,10 +1568,11 @@ class ChirieHandler(BaseHTTPRequestHandler):
             <div class="panel explain-panel">
                 <h2>How it behaves</h2>
                 <ul class="feature-list">
-                    <li>Rent is generated from this rule, so you do not need to add it every month.</li>
+                    <li>Rent is generated from this rule, so you do not need to add it every month or backfill it manually.</li>
+                    <li>When you save settings, missing rent entries are created for every month in each tenancy period.</li>
                     <li>The due date is clamped safely for shorter months.</li>
                     <li>Existing paid rent records stay untouched for history.</li>
-                    <li>If the current month's rent is still unpaid, saving settings updates its amount and due date.</li>
+                    <li>If an unpaid generated rent exists, saving settings updates its amount and due date.</li>
                 </ul>
             </div>
         </section>
