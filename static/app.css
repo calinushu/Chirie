@@ -525,6 +525,12 @@ dd {
   font-size: 12px;
 }
 
+.table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .muted,
 .subtle,
 .hint {
@@ -1247,6 +1253,11 @@ code {
 
   .payment-form button {
     grid-column: 1 / -1;
+  }
+
+  .table-actions {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
   form label {

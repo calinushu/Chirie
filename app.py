@@ -1162,6 +1162,8 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.save_tenancy(fields)
         if path.startswith("/admin/tenancies/") and path.endswith("/edit"):
             return self.save_tenancy(fields, path.split("/")[3])
+        if path.startswith("/admin/tenancies/") and path.endswith("/delete"):
+            return self.delete_tenancy(path.split("/")[3])
         if path == "/admin/settings":
             return self.save_settings(fields)
         if path.startswith("/admin/users/") and path.endswith("/toggle"):
@@ -1482,7 +1484,15 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 <td>{esc(row["end_date"] or "Active")}</td>
                 <td>{esc("" if row["start_electricity"] is None else f'{row["start_electricity"]:g}')} / {esc("" if row["end_electricity"] is None else f'{row["end_electricity"]:g}')}</td>
                 <td>{esc("" if row["start_gas"] is None else f'{row["start_gas"]:g}')} / {esc("" if row["end_gas"] is None else f'{row["end_gas"]:g}')}</td>
-                <td><a class="button small ghost" href="/admin/tenancies/{row["id"]}/edit">Edit</a></td>
+                <td>
+                    <div class="table-actions">
+                        <a class="button small ghost" href="/admin/tenancies/{row["id"]}/edit">Edit</a>
+                        <form method="post" action="/admin/tenancies/{row["id"]}/delete">
+                            {csrf_input(self.user)}
+                            <button class="small danger" type="submit">Delete</button>
+                        </form>
+                    </div>
+                </td>
             </tr>
             """
             for row in rows
@@ -1557,18 +1567,17 @@ class ChirieHandler(BaseHTTPRequestHandler):
         end_date = fields.get("end_date", "")
         if end_date and end_date < start_date:
             return self.tenancy_form(tenancy_id, "End date cannot be before the start date.", fields)
-        overlap_params: list[Any] = [user_id, end_date or "9999-12-31", start_date]
+        overlap_params: list[Any] = [end_date or "9999-12-31", start_date]
         overlap_sql = """
             SELECT id FROM tenancies
-            WHERE user_id = ?
-              AND start_date <= ?
+            WHERE start_date <= ?
               AND COALESCE(NULLIF(end_date, ''), '9999-12-31') >= ?
         """
         if parsed_id:
             overlap_sql += " AND id != ?"
             overlap_params.append(parsed_id)
         if query_one(overlap_sql, tuple(overlap_params)):
-            return self.tenancy_form(tenancy_id, "This tenant already has an overlapping tenancy period.", fields)
+            return self.tenancy_form(tenancy_id, "This period overlaps another tenancy. Close or delete the existing tenancy first.", fields)
         values = (
             user_id,
             label,
@@ -1600,6 +1609,23 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 """,
                 values[:-1] + (now_iso(), now_iso()),
             )
+        redirect(self, "/admin/tenancies")
+
+    def delete_tenancy(self, tenancy_id: str) -> None:
+        if not require_admin(self):
+            return
+        parsed_id = parse_int(tenancy_id)
+        if parsed_id is None:
+            return self.not_found()
+        utilities = query_all("SELECT id FROM utility_entries WHERE tenancy_id = ?", (parsed_id,))
+        charges = query_all("SELECT id FROM charges WHERE tenancy_id = ?", (parsed_id,))
+        for row in utilities:
+            self.delete_attached_files("utility_entry_id", row["id"])
+        for row in charges:
+            self.delete_attached_files("charge_id", row["id"])
+        execute("DELETE FROM utility_entries WHERE tenancy_id = ?", (parsed_id,))
+        execute("DELETE FROM charges WHERE tenancy_id = ?", (parsed_id,))
+        execute("DELETE FROM tenancies WHERE id = ?", (parsed_id,))
         redirect(self, "/admin/tenancies")
 
     def users_page(self) -> None:
