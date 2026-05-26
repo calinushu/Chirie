@@ -422,6 +422,7 @@ nav {
 }
 .pill.paid { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
 .pill.due  { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.partial { background: #EEE7D3; color: #80610B; border-color: transparent; }
 .pill.role { background: var(--paper-2); color: var(--ink-2); }
 
 .tenant-chip {
@@ -498,6 +499,31 @@ dd {
   overflow-wrap: anywhere;
 }
 .file-link:hover { background: var(--paper-3); }
+
+.payment-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-family: "Geist Mono", ui-monospace, Menlo, monospace;
+  font-size: 11.5px;
+}
+
+.payment-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.payment-form input {
+  width: 8.5rem;
+  min-height: 28px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+}
 
 .muted,
 .subtle,

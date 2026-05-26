@@ -9,6 +9,7 @@ A small private expense tracker for a rented apartment. It uses Python standard 
 - Admin can create tenancy periods with start/end dates and move-in/move-out gas and electricity readings.
 - Tenants can view only the records assigned to their tenancy periods: current amount to pay, rent, utility history, readings, trends, and bill attachments.
 - Only admins can add bills, configure rent, manage tenancies, edit entries, create users, or mark items paid/unpaid.
+- Admins can record partial payments against rent, charges, and utility bills.
 - Rent is configured once as a recurring monthly charge with a configurable due day.
 - Utility records for electricity, gas, common bills, and internet.
 - Utility readings support actual readings, estimates, corrections/credits, meter rollover, and final move-out readings.
