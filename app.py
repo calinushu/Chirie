@@ -286,6 +286,9 @@ def migrate() -> None:
             "service_end": "TEXT",
         }.items():
             add_column_if_missing(db, "charges", column, definition)
+        for table in ("utility_entries", "charges"):
+            add_column_if_missing(db, table, "admin_paid", "INTEGER NOT NULL DEFAULT 0")
+            add_column_if_missing(db, table, "admin_paid_at", "TEXT")
         db.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_tenancies_dates ON tenancies(start_date, end_date);
@@ -394,6 +397,16 @@ def months_between(start_date: str, end_date: str) -> list[str]:
     return months
 
 
+def days_overdue(due_date: Any) -> int:
+    if not due_date:
+        return 0
+    try:
+        due = datetime.strptime(str(due_date), "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+    return max((datetime.now().date() - due).days, 0)
+
+
 def active_tenancy_for_date(date_value: str) -> sqlite3.Row | None:
     return query_one(
         """
@@ -499,12 +512,28 @@ def redirect(handler: BaseHTTPRequestHandler, path: str) -> None:
     handler.end_headers()
 
 
-def static_response(handler: BaseHTTPRequestHandler, content: bytes, content_type: str, status: int = 200) -> None:
+def flash_redirect(handler: BaseHTTPRequestHandler, path: str, message: str, kind: str = "ok") -> None:
+    handler.send_response(HTTPStatus.SEE_OTHER)
+    send_security_headers(handler)
+    handler.send_header("Location", path)
+    handler.send_header("Set-Cookie", make_cookie("flash", quote(f"{kind}|{message}"), 60))
+    handler.end_headers()
+
+
+def static_response(
+    handler: BaseHTTPRequestHandler,
+    content: bytes,
+    content_type: str,
+    status: int = 200,
+    extra_headers: list[tuple[str, str]] | None = None,
+) -> None:
     handler.send_response(status)
     send_security_headers(handler)
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(content)))
     handler.send_header("Cache-Control", "no-store")
+    for name, value in extra_headers or []:
+        handler.send_header(name, value)
     handler.end_headers()
     handler.wfile.write(content)
 
@@ -555,6 +584,7 @@ def layout(title: str, user: sqlite3.Row | None, content: str, active: str = "")
                 [
                     ("/admin/utility/new", "Add bill", "utility"),
                     ("/admin/charge/new", "Add charge", "charge"),
+                    ("/admin/lump-payment", "Lump payment", "lump"),
                     ("/admin/tenancies", "Tenancies", "tenancies"),
                     ("/admin/settings", "Settings", "settings"),
                     ("/admin/users", "Users", "users"),
@@ -644,9 +674,11 @@ def payment_state(target: str, row_id: int, amount: Any, paid: Any) -> dict[str,
     }
 
 
-def payment_status_pill(state: dict[str, Any]) -> str:
+def payment_status_pill(state: dict[str, Any], due_date: Any = None) -> str:
     if state["is_paid"]:
         return '<span class="pill paid">Paid</span>'
+    if days_overdue(due_date) > 0:
+        return '<span class="pill overdue">Overdue</span>'
     if state["is_partial"]:
         return '<span class="pill partial">Partial</span>'
     return '<span class="pill due">To pay</span>'
@@ -680,6 +712,45 @@ def payment_summary(target: str, row_id: int, amount: Any, paid: Any) -> str:
         <span>Remaining {money(state["remaining"])}</span>
     </div>
     """
+
+
+def admin_paid_control(target: str, row: sqlite3.Row, user: sqlite3.Row, next_path: str = "/dashboard") -> str:
+    # Tracks whether the admin paid the supplier; rent has no supplier.
+    if user["role"] != "admin" or (target == "charge" and row["charge_type"] == "rent"):
+        return ""
+    done = int(row["admin_paid"] or 0)
+    pill = f'<span class="pill paid">I paid {esc(row["admin_paid_at"] or "")}</span>' if done else '<span class="pill due">I haven\'t paid</span>'
+    return f"""
+    <form class="payment-form" method="post" action="/admin/{target}/{row["id"]}/toggle-admin-paid">
+        {csrf_input(user)}
+        <input type="hidden" name="next" value="{esc(next_path)}">
+        {pill}
+        <button class="small ghost" type="submit">{"Undo I paid" if done else "Mark I paid"}</button>
+    </form>
+    """
+
+
+def allocate_oldest_first(amount: float, remainings: list[float]) -> list[float]:
+    allocations = []
+    for remaining in remainings:
+        take = round(min(max(amount, 0), remaining), 2)
+        allocations.append(take)
+        amount = round(amount - take, 2)
+    return allocations
+
+
+def open_bills(tenancy_id: int | None = None) -> list[dict[str, Any]]:
+    scope = " WHERE tenancy_id = ?" if tenancy_id else ""
+    params = (tenancy_id,) if tenancy_id else ()
+    items = []
+    for target, table, amount_column in (("utility", "utility_entries", "bill_amount"), ("charge", "charges", "amount")):
+        for row in query_all(f"SELECT * FROM {table}{scope}", params):
+            state = payment_state(target, row["id"], row[amount_column], row["paid"])
+            if state["remaining"] > 0.004:
+                label = UTILITY_TYPES.get(row["utility_type"], row["utility_type"]) if target == "utility" else row["title"]
+                items.append({"target": target, "row": row, "label": label, "remaining": round(state["remaining"], 2)})
+    items.sort(key=lambda item: (item["row"]["due_date"] or f'{item["row"]["month"]}-01', item["row"]["month"], item["row"]["id"]))
+    return items
 
 
 def role_badge(role: str) -> str:
@@ -851,12 +922,17 @@ def utility_card(entry: sqlite3.Row, user: sqlite3.Row) -> str:
             <input name="paid_on" type="date" value="{esc(today())}" aria-label="Payment date">
             <button class="small ghost" type="submit">Add payment</button>
         </form>
+        {admin_paid_control("utility", entry, user)}
         <a class="button small ghost" href="/admin/utility/{entry["id"]}/edit">Edit</a>
-        <form method="post" action="/admin/utility/{entry["id"]}/delete">
+        <form method="post" action="/admin/utility/{entry["id"]}/delete" data-confirm="{esc(f'Delete this {UTILITY_TYPES.get(entry["utility_type"], entry["utility_type"])} bill for {month_label(entry["month"])}? Its payments and attached files are permanently deleted.')}">
             {csrf_input(user)}
             <button class="small danger" type="submit">Delete</button>
         </form>
         """
+    late_days = 0 if state["is_paid"] else days_overdue(entry["due_date"])
+    due_display = esc(entry["due_date"] or "Not set")
+    if late_days:
+        due_display = f'<span class="overdue-text">{esc(entry["due_date"])} · {late_days} day{"s" if late_days != 1 else ""} overdue</span>'
     return f"""
     <article class="item-card">
         <div class="item-top">
@@ -864,12 +940,12 @@ def utility_card(entry: sqlite3.Row, user: sqlite3.Row) -> str:
                 <h3>{esc(UTILITY_TYPES.get(entry["utility_type"], entry["utility_type"]))}</h3>
                 <p>{esc(month_label(entry["month"]))}</p>
             </div>
-            {payment_status_pill(state)}
+            {payment_status_pill(state, entry["due_date"])}
         </div>
         <dl class="compact-list">
             <div><dt>Amount</dt><dd>{money(entry["bill_amount"])}</dd></div>
             <div><dt>Reading</dt><dd>{esc(reading)}</dd></div>
-            <div><dt>Due</dt><dd>{esc(entry["due_date"] or "Not set")}</dd></div>
+            <div><dt>Due</dt><dd>{due_display}</dd></div>
         </dl>
         <div class="meta-line"><span>{esc(READING_MODES.get(entry["reading_mode"], "Actual reading"))}</span>{service_period}{consumption}{adjustment}<span>{esc(entry["notes"] or "")}</span></div>
         {payment_summary("utility", entry["id"], entry["bill_amount"], entry["paid"])}
@@ -901,8 +977,9 @@ def charge_card(charge: sqlite3.Row, user: sqlite3.Row) -> str:
             <input name="paid_on" type="date" value="{esc(today())}" aria-label="Payment date">
             <button class="small ghost" type="submit">Add payment</button>
         </form>
+        {admin_paid_control("charge", charge, user)}
         {edit_link}
-        <form method="post" action="/admin/charge/{charge["id"]}/delete">
+        <form method="post" action="/admin/charge/{charge["id"]}/delete" data-confirm="{esc(f'Delete the charge "{charge["title"]}" for {month_label(charge["month"])}? Its payments and attached files are permanently deleted.')}">
             {csrf_input(user)}
             <button class="small danger" type="submit">Delete</button>
         </form>
@@ -910,6 +987,10 @@ def charge_card(charge: sqlite3.Row, user: sqlite3.Row) -> str:
     service_period = ""
     if charge["service_start"] or charge["service_end"]:
         service_period = f'<span>{esc(charge["service_start"] or "?")} to {esc(charge["service_end"] or "?")}</span>'
+    late_days = 0 if state["is_paid"] else days_overdue(charge["due_date"])
+    due_display = esc(charge["due_date"] or "Not set")
+    if late_days:
+        due_display = f'<span class="overdue-text">{esc(charge["due_date"])} · {late_days} day{"s" if late_days != 1 else ""} overdue</span>'
     return f"""
     <article class="item-card">
         <div class="item-top">
@@ -917,11 +998,11 @@ def charge_card(charge: sqlite3.Row, user: sqlite3.Row) -> str:
                 <h3>{esc(charge["title"])}</h3>
                 <p>{esc(month_label(charge["month"]))} · {esc(CHARGE_TYPES.get(charge["charge_type"], charge["charge_type"]))}</p>
             </div>
-            {payment_status_pill(state)}
+            {payment_status_pill(state, charge["due_date"])}
         </div>
         <dl class="compact-list">
             <div><dt>Amount</dt><dd>{money(charge["amount"])}</dd></div>
-            <div><dt>Due</dt><dd>{esc(charge["due_date"] or "Not set")}</dd></div>
+            <div><dt>Due</dt><dd>{due_display}</dd></div>
         </dl>
         <div class="meta-line">{service_period}<span>{esc(charge["notes"] or "")}</span></div>
         {payment_summary("charge", charge["id"], charge["amount"], charge["paid"])}
@@ -1131,6 +1212,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             "/admin/settings": self.settings_page,
             "/admin/utility/new": self.utility_form,
             "/admin/charge/new": self.charge_form,
+            "/admin/lump-payment": lambda: self.lump_payment_page(parse_qs(parsed.query)),
         }
         if path in routes:
             return routes[path]()
@@ -1168,6 +1250,10 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.save_settings(fields)
         if path.startswith("/admin/users/") and path.endswith("/toggle"):
             return self.toggle_user(path.split("/")[3])
+        if path == "/admin/lump-payment":
+            return self.save_lump_payment(fields)
+        if path.startswith("/admin/") and path.endswith("/toggle-admin-paid") and path.split("/")[2] in ("utility", "charge"):
+            return self.toggle_admin_paid(path.split("/")[2], path.split("/")[3], fields)
         if path == "/admin/utility":
             return self.save_utility(fields, files)
         if path.startswith("/admin/utility/") and path.endswith("/edit"):
@@ -1191,8 +1277,15 @@ class ChirieHandler(BaseHTTPRequestHandler):
         self.not_found()
 
     def render(self, title: str, content: str, status: int = 200, active: str = "") -> None:
+        extra_headers = None
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        if "flash" in cookie and cookie["flash"].value:
+            kind, _, message = unquote(cookie["flash"].value).partition("|")
+            if message and self.user:
+                content = flash(message, kind if kind in ("ok", "error") else "ok") + content
+            extra_headers = [("Set-Cookie", make_cookie("flash", "", 0))]
         body = layout(title, self.user, content, active)
-        static_response(self, body, "text/html; charset=utf-8", status)
+        static_response(self, body, "text/html; charset=utf-8", status, extra_headers)
 
     def not_found(self) -> None:
         self.render("Not found", "<div class='empty'><strong>That page does not exist.</strong><span>Try the dashboard.</span></div>", HTTPStatus.NOT_FOUND)
@@ -1371,22 +1464,33 @@ class ChirieHandler(BaseHTTPRequestHandler):
             paid_total = sum(payment_state("utility", row["id"], row["bill_amount"], row["paid"])["paid"] for row in all_utilities)
             paid_total += sum(payment_state("charge", row["id"], row["amount"], row["paid"])["paid"] for row in all_charges)
         actions = ""
+        admin_stat = ""
         if self.user["role"] == "admin":
+            owed_by_me = sum(float(row["bill_amount"] or 0) for row in all_utilities if not row["admin_paid"])
+            owed_by_me += sum(float(row["amount"] or 0) for row in all_charges if row["charge_type"] != "rent" and not row["admin_paid"])
+            admin_stat = f'<div class="stat"><span>I still owe</span><strong>{money(owed_by_me)}</strong><small>Bills not marked as paid by you</small></div>'
             actions = '<a class="button" href="/admin/utility/new">Add utility bill</a><a class="button secondary" href="/admin/settings">Rent settings</a><a class="button ghost" href="/admin/charge/new">Add one-off charge</a>'
-        due_cards = "".join(charge_card(row, self.user) for row in unpaid_charges) + "".join(utility_card(row, self.user) for row in unpaid_utilities)
+        due_items = [("charge", row) for row in unpaid_charges] + [("utility", row) for row in unpaid_utilities]
+        due_items.sort(key=lambda pair: (pair[1]["due_date"] or "9999-12-31", pair[1]["month"]))
+        due_cards = "".join(
+            charge_card(row, self.user) if kind == "charge" else utility_card(row, self.user)
+            for kind, row in due_items
+        )
+        overdue_count = sum(1 for _, row in due_items if days_overdue(row["due_date"]) > 0)
         month_cards = "".join(utility_card(row, self.user) for row in month_utilities)
         rent_amount = parse_float(get_setting("rent_amount", "0"), 0)
         rent_due_day = parse_int(get_setting("rent_due_day", "1")) or 1
         content = f"""
         {page_header(APARTMENT_NAME, "A clean monthly view of what is owed, what is recorded, and how utilities are moving.", actions)}
-        <section class="stats-grid">
+        <section class="stats-grid{" four" if admin_stat else ""}">
             <div class="stat"><span>Currently due</span><strong>{money(total_due)}</strong><small>Rent + utilities awaiting payment</small></div>
             <div class="stat"><span>Paid total</span><strong>{money(paid_total)}</strong><small>All recorded paid entries</small></div>
             <div class="stat"><span>Rent rule</span><strong>{money(rent_amount)}</strong><small>Due on day {rent_due_day} every month</small></div>
+            {admin_stat}
         </section>
         <section class="dashboard-grid">
             <div class="section-block primary-section">
-                <div class="section-title"><h2>Needs payment</h2><p>{len(unpaid_utilities) + len(unpaid_charges)} open item{"s" if len(unpaid_utilities) + len(unpaid_charges) != 1 else ""}; only admin can mark them paid.</p></div>
+                <div class="section-title"><h2>Needs payment</h2><p>{len(due_items)} open item{"s" if len(due_items) != 1 else ""}{f", {overdue_count} overdue" if overdue_count else ""}; sorted by due date, earliest first.</p></div>
                 <div class="cards-grid due-grid">{due_cards or table_empty("Nothing due right now.")}</div>
             </div>
             <aside class="month-panel">
@@ -1413,6 +1517,8 @@ class ChirieHandler(BaseHTTPRequestHandler):
             placeholders = ",".join("?" for _ in tenancy_ids)
             utilities = query_all(f"SELECT * FROM utility_entries WHERE tenancy_id IN ({placeholders}) ORDER BY month DESC, id DESC", tuple(tenancy_ids))
             charges = query_all(f"SELECT * FROM charges WHERE tenancy_id IN ({placeholders}) ORDER BY month DESC, id DESC", tuple(tenancy_ids))
+        is_admin = self.user["role"] == "admin"
+        admin_th = "<th>My payment</th>" if is_admin else ""
         utility_rows = "".join(
             f"""
             <tr>
@@ -1422,8 +1528,9 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 <td>{esc("" if row["current_reading"] is None else f'{row["current_reading"]:g}')}</td>
                 <td>{esc(READING_MODES.get(row["reading_mode"], "Actual reading"))}</td>
                 <td>{tenancy_badge(row["tenancy_id"])}</td>
-                <td>{payment_status_pill(payment_state("utility", row["id"], row["bill_amount"], row["paid"]))}</td>
+                <td>{payment_status_pill(payment_state("utility", row["id"], row["bill_amount"], row["paid"]), row["due_date"])}</td>
                 <td>{attachment_links(row["id"], "utility")}</td>
+                {f'<td>{admin_paid_control("utility", row, self.user, "/history")}</td>' if is_admin else ""}
             </tr>
             """
             for row in utilities
@@ -1436,8 +1543,9 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 <td>{money(row["amount"])}</td>
                 <td>{esc(row["due_date"] or "")}</td>
                 <td>{tenancy_badge(row["tenancy_id"])}</td>
-                <td>{payment_status_pill(payment_state("charge", row["id"], row["amount"], row["paid"]))}</td>
+                <td>{payment_status_pill(payment_state("charge", row["id"], row["amount"], row["paid"]), row["due_date"])}</td>
                 <td>{attachment_links(row["id"], "charge")}</td>
+                {f'<td>{admin_paid_control("charge", row, self.user, "/history")}</td>' if is_admin else ""}
             </tr>
             """
             for row in charges
@@ -1448,8 +1556,8 @@ class ChirieHandler(BaseHTTPRequestHandler):
             <div class="section-title"><h2>Utilities</h2><p>Electricity, gas, common bills and internet.</p></div>
             <div class="table-wrap">
                 <table>
-                    <thead><tr><th>Month</th><th>Type</th><th>Amount</th><th>Reading</th><th>Mode</th><th>Tenancy</th><th>Status</th><th>Bill</th></tr></thead>
-                    <tbody>{utility_rows or '<tr><td colspan="8">No utility history yet.</td></tr>'}</tbody>
+                    <thead><tr><th>Month</th><th>Type</th><th>Amount</th><th>Reading</th><th>Mode</th><th>Tenancy</th><th>Status</th><th>Bill</th>{admin_th}</tr></thead>
+                    <tbody>{utility_rows or '<tr><td colspan="9">No utility history yet.</td></tr>'}</tbody>
                 </table>
             </div>
         </section>
@@ -1457,8 +1565,8 @@ class ChirieHandler(BaseHTTPRequestHandler):
             <div class="section-title"><h2>Rent and charges</h2><p>Rent and any one-off apartment charges.</p></div>
             <div class="table-wrap">
                 <table>
-                    <thead><tr><th>Month</th><th>Title</th><th>Amount</th><th>Due</th><th>Tenancy</th><th>Status</th><th>File</th></tr></thead>
-                    <tbody>{charge_rows or '<tr><td colspan="7">No rent history yet.</td></tr>'}</tbody>
+                    <thead><tr><th>Month</th><th>Title</th><th>Amount</th><th>Due</th><th>Tenancy</th><th>Status</th><th>File</th>{admin_th}</tr></thead>
+                    <tbody>{charge_rows or '<tr><td colspan="8">No rent history yet.</td></tr>'}</tbody>
                 </table>
             </div>
         </section>
@@ -1470,7 +1578,9 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return
         rows = query_all(
             """
-            SELECT tenancies.*, users.name AS tenant_name, users.email AS tenant_email
+            SELECT tenancies.*, users.name AS tenant_name, users.email AS tenant_email,
+                   (SELECT COUNT(*) FROM utility_entries WHERE tenancy_id = tenancies.id) AS utility_count,
+                   (SELECT COUNT(*) FROM charges WHERE tenancy_id = tenancies.id) AS charge_count
             FROM tenancies
             JOIN users ON users.id = tenancies.user_id
             ORDER BY COALESCE(tenancies.end_date, '9999-12-31') DESC, tenancies.start_date DESC
@@ -1487,7 +1597,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 <td>
                     <div class="table-actions">
                         <a class="button small ghost" href="/admin/tenancies/{row["id"]}/edit">Edit</a>
-                        <form method="post" action="/admin/tenancies/{row["id"]}/delete">
+                        <form method="post" action="/admin/tenancies/{row["id"]}/delete" data-confirm="{esc(f'Delete the tenancy "{row["label"]}" for {row["tenant_name"]}? This permanently deletes {row["utility_count"]} utility bill{"s" if row["utility_count"] != 1 else ""} and {row["charge_count"]} charge{"s" if row["charge_count"] != 1 else ""}, including their payments and files.')}">
                             {csrf_input(self.user)}
                             <button class="small danger" type="submit">Delete</button>
                         </form>
@@ -1561,7 +1671,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         user_id = parse_int(fields.get("user_id"))
         if user_id is None:
-            return redirect(self, "/admin/tenancies")
+            return flash_redirect(self, "/admin/tenancies", "Choose a tenant for the tenancy.", "error")
         label = fields.get("label", "").strip() or "Tenancy"
         start_date = fields.get("start_date", today())
         end_date = fields.get("end_date", "")
@@ -1609,7 +1719,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 """,
                 values[:-1] + (now_iso(), now_iso()),
             )
-        redirect(self, "/admin/tenancies")
+        flash_redirect(self, "/admin/tenancies", "Tenancy saved.")
 
     def delete_tenancy(self, tenancy_id: str) -> None:
         if not require_admin(self):
@@ -1626,7 +1736,11 @@ class ChirieHandler(BaseHTTPRequestHandler):
         execute("DELETE FROM utility_entries WHERE tenancy_id = ?", (parsed_id,))
         execute("DELETE FROM charges WHERE tenancy_id = ?", (parsed_id,))
         execute("DELETE FROM tenancies WHERE id = ?", (parsed_id,))
-        redirect(self, "/admin/tenancies")
+        flash_redirect(
+            self,
+            "/admin/tenancies",
+            f"Tenancy deleted along with {len(utilities)} utility bill{'s' if len(utilities) != 1 else ''} and {len(charges)} charge{'s' if len(charges) != 1 else ''}.",
+        )
 
     def users_page(self) -> None:
         if not require_admin(self):
@@ -1717,7 +1831,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
         set_setting("rent_due_day", str(rent_due_day))
         set_setting("rent_enabled", rent_enabled)
         ensure_recurring_rent(update_unpaid=True)
-        redirect(self, "/admin/settings")
+        flash_redirect(self, "/admin/settings", "Rent settings saved. Missing rent entries were generated.")
 
     def create_user(self, fields: dict[str, str]) -> None:
         if not require_admin(self):
@@ -1727,15 +1841,15 @@ class ChirieHandler(BaseHTTPRequestHandler):
         password = fields.get("password", "")
         role = fields.get("role", "tenant")
         if role not in ("admin", "tenant") or not name or not email or len(password) < 8:
-            return redirect(self, "/admin/users")
+            return flash_redirect(self, "/admin/users", "Fill in name, email, and a password of at least 8 characters.", "error")
         try:
             execute(
                 "INSERT INTO users (name, email, password_hash, role, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
                 (name, email, password_hash(password), role, now_iso()),
             )
         except sqlite3.IntegrityError:
-            pass
-        redirect(self, "/admin/users")
+            return flash_redirect(self, "/admin/users", "That email is already registered.", "error")
+        flash_redirect(self, "/admin/users", f"Account created for {name}.")
 
     def toggle_user(self, user_id: str) -> None:
         if not require_admin(self):
@@ -1745,9 +1859,13 @@ class ChirieHandler(BaseHTTPRequestHandler):
         except ValueError:
             return self.not_found()
         if uid == self.user["id"]:
-            return redirect(self, "/admin/users")
+            return flash_redirect(self, "/admin/users", "You cannot disable your own account.", "error")
         execute("UPDATE users SET active = CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id = ?", (uid,))
-        redirect(self, "/admin/users")
+        row = query_one("SELECT name, active FROM users WHERE id = ?", (uid,))
+        if row:
+            flash_redirect(self, "/admin/users", f"{row['name']} {'enabled' if row['active'] else 'disabled'}.")
+        else:
+            redirect(self, "/admin/users")
 
     def utility_form(self, entry_id: str | None = None, error: str = "", values: dict[str, str] | None = None) -> None:
         if not require_admin(self):
@@ -1887,7 +2005,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 (tenancy_id, utility_type, month, service_start, service_end, reading_mode, previous_value, current_value, consumption, rollover_limit, adjustment_amount, bill_amount, due_date, notes, self.user["id"], now_iso(), now_iso()),
             )
         self.save_files(files, utility_entry_id=row_id)
-        redirect(self, "/dashboard")
+        flash_redirect(self, "/dashboard", "Utility bill saved.")
 
     def toggle_utility_paid(self, entry_id: str) -> None:
         if not require_admin(self):
@@ -1900,19 +2018,22 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         state = payment_state("utility", parsed_entry_id, row["bill_amount"], row["paid"])
         if state["is_paid"]:
-            execute("DELETE FROM payments WHERE utility_entry_id = ?", (parsed_entry_id,))
+            execute("DELETE FROM payments WHERE utility_entry_id = ? AND notes = 'Marked paid'", (parsed_entry_id,))
             execute("UPDATE utility_entries SET paid = 0, paid_at = NULL, updated_at = ? WHERE id = ?", (now_iso(), parsed_entry_id))
-        else:
-            if state["remaining"] > 0:
-                execute(
-                    """
-                    INSERT INTO payments (utility_entry_id, amount, paid_on, notes, created_by, created_at)
-                    VALUES (?, ?, ?, 'Marked paid', ?, ?)
-                    """,
-                    (parsed_entry_id, state["remaining"], today(), self.user["id"], now_iso()),
-                )
             sync_paid_flag("utility", parsed_entry_id)
-        redirect(self, "/dashboard")
+            if payment_state("utility", parsed_entry_id, row["bill_amount"], 0)["is_paid"]:
+                return flash_redirect(self, "/dashboard", "Recorded payments still cover this bill, so it stays paid. Adjust its payments to reopen it.", "error")
+            return flash_redirect(self, "/dashboard", "Marked unpaid. Recorded partial payments were kept.")
+        if state["remaining"] > 0:
+            execute(
+                """
+                INSERT INTO payments (utility_entry_id, amount, paid_on, notes, created_by, created_at)
+                VALUES (?, ?, ?, 'Marked paid', ?, ?)
+                """,
+                (parsed_entry_id, state["remaining"], today(), self.user["id"], now_iso()),
+            )
+        sync_paid_flag("utility", parsed_entry_id)
+        flash_redirect(self, "/dashboard", "Marked paid.")
 
     def add_utility_payment(self, entry_id: str, fields: dict[str, str]) -> None:
         if not require_admin(self):
@@ -1925,10 +2046,10 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         amount = parse_float(fields.get("amount"), 0)
         if amount <= 0:
-            return redirect(self, "/dashboard")
+            return flash_redirect(self, "/dashboard", "Enter a payment amount above zero.", "error")
         state = payment_state("utility", parsed_entry_id, row["bill_amount"], row["paid"])
         if state["remaining"] <= 0:
-            return redirect(self, "/dashboard")
+            return flash_redirect(self, "/dashboard", "This bill is already fully paid.", "error")
         amount = min(amount, state["remaining"])
         execute(
             """
@@ -1938,7 +2059,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             (parsed_entry_id, amount, fields.get("paid_on") or today(), fields.get("notes", "").strip(), self.user["id"], now_iso()),
         )
         sync_paid_flag("utility", parsed_entry_id)
-        redirect(self, "/dashboard")
+        flash_redirect(self, "/dashboard", f"Payment of {money(amount)} recorded.")
 
     def delete_utility(self, entry_id: str) -> None:
         if not require_admin(self):
@@ -1948,7 +2069,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         self.delete_attached_files("utility_entry_id", parsed_entry_id)
         execute("DELETE FROM utility_entries WHERE id = ?", (parsed_entry_id,))
-        redirect(self, "/dashboard")
+        flash_redirect(self, "/dashboard", "Utility bill deleted.")
 
     def charge_form(self, charge_id: str | None = None) -> None:
         if not require_admin(self):
@@ -2028,7 +2149,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 (tenancy_id, charge_type, month, service_start, service_end, title, amount, due_date, notes, self.user["id"], now_iso(), now_iso()),
             )
         self.save_files(files, charge_id=row_id)
-        redirect(self, "/dashboard")
+        flash_redirect(self, "/dashboard", "Charge saved.")
 
     def toggle_charge_paid(self, charge_id: str) -> None:
         if not require_admin(self):
@@ -2041,19 +2162,22 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         state = payment_state("charge", parsed_charge_id, row["amount"], row["paid"])
         if state["is_paid"]:
-            execute("DELETE FROM payments WHERE charge_id = ?", (parsed_charge_id,))
+            execute("DELETE FROM payments WHERE charge_id = ? AND notes = 'Marked paid'", (parsed_charge_id,))
             execute("UPDATE charges SET paid = 0, paid_at = NULL, updated_at = ? WHERE id = ?", (now_iso(), parsed_charge_id))
-        else:
-            if state["remaining"] > 0:
-                execute(
-                    """
-                    INSERT INTO payments (charge_id, amount, paid_on, notes, created_by, created_at)
-                    VALUES (?, ?, ?, 'Marked paid', ?, ?)
-                    """,
-                    (parsed_charge_id, state["remaining"], today(), self.user["id"], now_iso()),
-                )
             sync_paid_flag("charge", parsed_charge_id)
-        redirect(self, "/dashboard")
+            if payment_state("charge", parsed_charge_id, row["amount"], 0)["is_paid"]:
+                return flash_redirect(self, "/dashboard", "Recorded payments still cover this charge, so it stays paid. Adjust its payments to reopen it.", "error")
+            return flash_redirect(self, "/dashboard", "Marked unpaid. Recorded partial payments were kept.")
+        if state["remaining"] > 0:
+            execute(
+                """
+                INSERT INTO payments (charge_id, amount, paid_on, notes, created_by, created_at)
+                VALUES (?, ?, ?, 'Marked paid', ?, ?)
+                """,
+                (parsed_charge_id, state["remaining"], today(), self.user["id"], now_iso()),
+            )
+        sync_paid_flag("charge", parsed_charge_id)
+        flash_redirect(self, "/dashboard", "Marked paid.")
 
     def add_charge_payment(self, charge_id: str, fields: dict[str, str]) -> None:
         if not require_admin(self):
@@ -2066,10 +2190,10 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         amount = parse_float(fields.get("amount"), 0)
         if amount <= 0:
-            return redirect(self, "/dashboard")
+            return flash_redirect(self, "/dashboard", "Enter a payment amount above zero.", "error")
         state = payment_state("charge", parsed_charge_id, row["amount"], row["paid"])
         if state["remaining"] <= 0:
-            return redirect(self, "/dashboard")
+            return flash_redirect(self, "/dashboard", "This charge is already fully paid.", "error")
         amount = min(amount, state["remaining"])
         execute(
             """
@@ -2079,7 +2203,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             (parsed_charge_id, amount, fields.get("paid_on") or today(), fields.get("notes", "").strip(), self.user["id"], now_iso()),
         )
         sync_paid_flag("charge", parsed_charge_id)
-        redirect(self, "/dashboard")
+        flash_redirect(self, "/dashboard", f"Payment of {money(amount)} recorded.")
 
     def delete_charge(self, charge_id: str) -> None:
         if not require_admin(self):
@@ -2089,7 +2213,117 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.not_found()
         self.delete_attached_files("charge_id", parsed_charge_id)
         execute("DELETE FROM charges WHERE id = ?", (parsed_charge_id,))
-        redirect(self, "/dashboard")
+        flash_redirect(self, "/dashboard", "Charge deleted.")
+
+    def toggle_admin_paid(self, target: str, row_id: str, fields: dict[str, str]) -> None:
+        if not require_admin(self):
+            return
+        parsed_id = parse_int(row_id)
+        table = "utility_entries" if target == "utility" else "charges"
+        row = query_one(f"SELECT * FROM {table} WHERE id = ?", (parsed_id,)) if parsed_id is not None else None
+        if not row:
+            return self.not_found()
+        new_value = 0 if int(row["admin_paid"] or 0) else 1
+        execute(
+            f"UPDATE {table} SET admin_paid = ?, admin_paid_at = CASE WHEN ? = 1 THEN ? ELSE NULL END, updated_at = ? WHERE id = ?",
+            (new_value, new_value, today(), now_iso(), parsed_id),
+        )
+        next_path = fields.get("next") if fields.get("next") in ("/dashboard", "/history") else "/dashboard"
+        flash_redirect(self, next_path, "Marked as paid by you." if new_value else "Marked as not paid by you.")
+
+    def lump_payment_page(self, query: dict[str, list[str]]) -> None:
+        if not require_admin(self):
+            return
+        tenancy_id = parse_int((query.get("tenancy_id") or [""])[-1])
+        raw_amount = (query.get("amount") or [""])[-1]
+        amount = parse_float(raw_amount, 0)
+        paid_on = (query.get("paid_on") or [today()])[-1] or today()
+        bills = open_bills(tenancy_id)
+        allocation_form = ""
+        if amount > 0:
+            proposals = allocate_oldest_first(amount, [bill["remaining"] for bill in bills])
+            rows = "".join(
+                f"""
+                <tr>
+                    <td>{esc(month_label(bill["row"]["month"]))}</td>
+                    <td>{esc(bill["label"])}</td>
+                    <td>{esc(bill["row"]["due_date"] or "")}</td>
+                    <td>{tenancy_badge(bill["row"]["tenancy_id"])}</td>
+                    <td>{money(bill["remaining"])}</td>
+                    <td><input name="alloc_{bill["target"]}_{bill["row"]["id"]}" inputmode="decimal" value="{proposal:.2f}" data-alloc aria-label="Amount for this bill"></td>
+                </tr>
+                """
+                for bill, proposal in zip(bills, proposals)
+            )
+            leftover = round(amount - sum(proposals), 2)
+            allocation_form = f"""
+            <form class="section-block" method="post" action="/admin/lump-payment" data-lump-total="{amount:.2f}">
+                {csrf_input(self.user)}
+                <input type="hidden" name="amount" value="{amount:.2f}">
+                <input type="hidden" name="paid_on" value="{esc(paid_on)}">
+                <div class="section-title"><h2>Proposed split</h2><p>Oldest bills first. Change any amount before saving.{f" {money(leftover)} is more than all open bills and will not be recorded." if leftover > 0 else ""}</p></div>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>Month</th><th>Bill</th><th>Due</th><th>Tenancy</th><th>Remaining</th><th>Apply</th></tr></thead>
+                        <tbody>{rows or '<tr><td colspan="6">No open bills.</td></tr>'}</tbody>
+                    </table>
+                </div>
+                <p class="form-note">Allocated <strong data-lump-sum>{money(sum(proposals))}</strong> of {money(amount)}</p>
+                <label>Notes<input name="notes" placeholder="e.g. bank transfer"></label>
+                <button type="submit">Record payments</button>
+            </form>
+            """
+        content = f"""
+        {page_header("Lump payment", "Split one tenant payment across open bills, oldest first.")}
+        <form class="panel wide-form" method="get" action="/admin/lump-payment">
+            <div class="form-grid">
+                <label>Tenant period<select name="tenancy_id"><option value="">All tenancies</option>{tenancy_options(tenancy_id or "", include_unassigned=False)}</select></label>
+                <label>Amount received (RON)<input name="amount" inputmode="decimal" value="{esc(raw_amount)}" required></label>
+                <label>Paid on<input name="paid_on" type="date" value="{esc(paid_on)}"></label>
+            </div>
+            <button type="submit">Propose split</button>
+        </form>
+        {allocation_form}
+        """
+        self.render("Lump payment", content, active="lump")
+
+    def save_lump_payment(self, fields: dict[str, str]) -> None:
+        if not require_admin(self):
+            return
+        lump = parse_float(fields.get("amount"), 0)
+        paid_on = fields.get("paid_on") or today()
+        allocations = []
+        for key, value in fields.items():
+            target, _, row_id = key.removeprefix("alloc_").partition("_")
+            if not key.startswith("alloc_") or target not in ("utility", "charge") or parse_int(row_id) is None:
+                continue
+            value_amount = round(parse_float(value, 0), 2)
+            if value_amount < 0:
+                return flash_redirect(self, "/admin/lump-payment", "Amounts cannot be negative.", "error")
+            if value_amount > 0:
+                allocations.append((target, int(row_id), value_amount))
+        total = round(sum(item[2] for item in allocations), 2)
+        if not allocations:
+            return flash_redirect(self, "/admin/lump-payment", "Nothing to record.", "error")
+        if total > lump + 0.004:
+            return flash_redirect(self, "/admin/lump-payment", f"Split adds up to {money(total)}, more than the {money(lump)} received.", "error")
+        note = f"Lump payment {money(lump)}" + (f" · {fields['notes'].strip()}" if fields.get("notes", "").strip() else "")
+        recorded = 0.0
+        for target, row_id, value_amount in allocations:
+            table, amount_column, column = ("utility_entries", "bill_amount", "utility_entry_id") if target == "utility" else ("charges", "amount", "charge_id")
+            row = query_one(f"SELECT * FROM {table} WHERE id = ?", (row_id,))
+            if not row:
+                continue
+            value_amount = min(value_amount, payment_state(target, row_id, row[amount_column], row["paid"])["remaining"])
+            if value_amount <= 0:
+                continue
+            execute(
+                f"INSERT INTO payments ({column}, amount, paid_on, notes, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (row_id, value_amount, paid_on, note, self.user["id"], now_iso()),
+            )
+            sync_paid_flag(target, row_id)
+            recorded += value_amount
+        flash_redirect(self, "/dashboard", f"Recorded {money(recorded)} across {len(allocations)} bill{'s' if len(allocations) != 1 else ''}.")
 
     def delete_attached_files(self, column: str, row_id: int) -> None:
         if column not in ("utility_entry_id", "charge_id"):

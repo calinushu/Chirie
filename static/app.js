@@ -45,6 +45,27 @@
       .filter(Boolean);
   }
 
+  document.querySelectorAll("form[data-confirm]").forEach(function (form) {
+    form.addEventListener("submit", function (event) {
+      if (!window.confirm(form.getAttribute("data-confirm"))) {
+        event.preventDefault();
+      }
+    });
+  });
+
+  document.querySelectorAll("form[data-lump-total]").forEach(function (form) {
+    var total = parseFloat(form.getAttribute("data-lump-total"));
+    var output = form.querySelector("[data-lump-sum]");
+    form.addEventListener("input", function () {
+      var sum = 0;
+      form.querySelectorAll("[data-alloc]").forEach(function (input) {
+        sum += parseFloat(input.value.replace(",", ".")) || 0;
+      });
+      output.textContent = sum.toFixed(2) + " RON";
+      output.classList.toggle("overdue-text", sum > total + 0.004);
+    });
+  });
+
   document.querySelectorAll("[data-paste-upload]").forEach(function (zone) {
     var form = zone.closest("form");
     if (!form) return;
