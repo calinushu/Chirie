@@ -296,6 +296,14 @@ def migrate() -> None:
             CREATE INDEX IF NOT EXISTS idx_charges_tenancy ON charges(tenancy_id);
             """
         )
+        try:
+            # One generated rent per tenancy and month, so concurrent page loads cannot double-bill.
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_generated_rent_unique ON charges(COALESCE(tenancy_id, 0), month) "
+                "WHERE charge_type = 'rent' AND notes = 'Recurring monthly rent'"
+            )
+        except sqlite3.IntegrityError:
+            print("Warning: duplicate generated rent rows exist; delete the extras so the rent uniqueness check can be enabled.")
         defaults = {
             "rent_amount": "0",
             "rent_due_day": "1",
@@ -446,7 +454,7 @@ def tenancy_label(row: sqlite3.Row | None) -> str:
     return f'{row["label"]} · {row["tenant_name"]} · {row["start_date"]} to {end}'
 
 
-def ensure_recurring_rent(update_unpaid: bool = False) -> None:
+def ensure_recurring_rent(update_unpaid: bool = False, reprice_tenancy_id: int | None = None) -> None:
     if get_setting("rent_enabled", "1") != "1":
         return
     amount = parse_float(get_setting("rent_amount", "0"), 0)
@@ -463,13 +471,40 @@ def ensure_recurring_rent(update_unpaid: bool = False) -> None:
             end_date = today()
         if end_date < tenancy["start_date"]:
             continue
-        for month in months_between(tenancy["start_date"], end_date):
-            ensure_rent_for_month(int(tenancy["id"]), month, amount, due_day, update_unpaid)
+        months = months_between(tenancy["start_date"], end_date)
+        for month in months:
+            # Past months keep their price, except the edges of a tenancy whose dates were just edited.
+            reprice = (update_unpaid and month >= current_month()) or (tenancy["id"] == reprice_tenancy_id and month in (months[0], months[-1]))
+            ensure_rent_for_month(int(tenancy["id"]), month, amount, due_day, reprice, tenancy["start_date"], tenancy["end_date"] or "")
 
 
-def ensure_rent_for_month(tenancy_id: int | None, month: str, amount: float, due_day: int, update_unpaid: bool = False) -> None:
-    due_date = due_date_for_month(month, due_day)
-    service_start, service_end = month_bounds(month)
+def ensure_rent_for_month(
+    tenancy_id: int | None, month: str, amount: float, due_day: int, update_unpaid: bool = False, start_date: str = "", end_date: str = ""
+) -> None:
+    try:
+        write_rent_for_month(tenancy_id, month, amount, due_day, update_unpaid, start_date, end_date)
+    except sqlite3.IntegrityError:
+        pass  # A concurrent request already created this month's rent.
+
+
+def prorated_rent(amount: float, month_start: str, month_end: str, service_start: str, service_end: str) -> float:
+    try:
+        days = (datetime.strptime(service_end, "%Y-%m-%d") - datetime.strptime(service_start, "%Y-%m-%d")).days + 1
+        month_days = int(month_end[-2:])
+    except ValueError:
+        return amount
+    return round(amount * max(min(days, month_days), 0) / month_days, 2)
+
+
+def write_rent_for_month(
+    tenancy_id: int | None, month: str, amount: float, due_day: int, update_unpaid: bool = False, start_date: str = "", end_date: str = ""
+) -> None:
+    month_start, month_end = month_bounds(month)
+    # Move-in and move-out months are charged only for the days the tenancy covers.
+    service_start = max(month_start, start_date or month_start)
+    service_end = min(month_end, end_date or month_end)
+    amount = prorated_rent(amount, month_start, month_end, service_start, service_end)
+    due_date = max(due_date_for_month(month, due_day), service_start)
     if tenancy_id is None:
         existing = query_one("SELECT * FROM charges WHERE charge_type = 'rent' AND month = ? AND tenancy_id IS NULL ORDER BY id LIMIT 1", (month,))
     else:
@@ -585,6 +620,7 @@ def layout(title: str, user: sqlite3.Row | None, content: str, active: str = "")
                     ("/admin/utility/new", "Add bill", "utility"),
                     ("/admin/charge/new", "Add charge", "charge"),
                     ("/admin/lump-payment", "Lump payment", "lump"),
+                    ("/admin/payments", "Payments", "payments"),
                     ("/admin/tenancies", "Tenancies", "tenancies"),
                     ("/admin/settings", "Settings", "settings"),
                     ("/admin/users", "Users", "users"),
@@ -1145,20 +1181,22 @@ def prune_attempts(key: str, timestamp: float) -> list[float]:
 def login_limited(ip_address: str, email: str) -> bool:
     timestamp = datetime.utcnow().timestamp()
     ip_attempts = prune_attempts(f"ip:{ip_address}", timestamp)
-    account_attempts = prune_attempts(f"account:{ip_address}:{email.lower()}", timestamp)
+    account_attempts = prune_attempts(f"account:{email.lower()}", timestamp)
     return len(ip_attempts) >= LOGIN_MAX_IP_ATTEMPTS or len(account_attempts) >= LOGIN_MAX_ACCOUNT_ATTEMPTS
 
 
 def record_failed_login(ip_address: str, email: str) -> None:
     timestamp = datetime.utcnow().timestamp()
-    for key in (f"ip:{ip_address}", f"account:{ip_address}:{email.lower()}"):
+    for key in [key for key, values in list(LOGIN_ATTEMPTS.items()) if timestamp - values[-1] >= LOGIN_WINDOW_SECONDS]:
+        LOGIN_ATTEMPTS.pop(key, None)
+    for key in (f"ip:{ip_address}", f"account:{email.lower()}"):
         attempts = prune_attempts(key, timestamp)
         attempts.append(timestamp)
         LOGIN_ATTEMPTS[key] = attempts
 
 
 def clear_failed_login(ip_address: str, email: str) -> None:
-    LOGIN_ATTEMPTS.pop(f"account:{ip_address}:{email.lower()}", None)
+    LOGIN_ATTEMPTS.pop(f"account:{email.lower()}", None)
 
 
 def require_admin(handler: "ChirieHandler") -> bool:
@@ -1185,7 +1223,8 @@ class ChirieHandler(BaseHTTPRequestHandler):
     def client_ip(self) -> str:
         forwarded_for = self.headers.get("X-Forwarded-For", "")
         if forwarded_for:
-            return forwarded_for.split(",", 1)[0].strip()
+            # The last entry is the one our reverse proxy appended; earlier ones are client-supplied.
+            return forwarded_for.rsplit(",", 1)[-1].strip()
         return self.client_address[0]
 
     def do_GET(self) -> None:
@@ -1213,6 +1252,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             "/admin/utility/new": self.utility_form,
             "/admin/charge/new": self.charge_form,
             "/admin/lump-payment": lambda: self.lump_payment_page(parse_qs(parsed.query)),
+            "/admin/payments": self.payments_page,
         }
         if path in routes:
             return routes[path]()
@@ -1252,6 +1292,8 @@ class ChirieHandler(BaseHTTPRequestHandler):
             return self.toggle_user(path.split("/")[3])
         if path == "/admin/lump-payment":
             return self.save_lump_payment(fields)
+        if path.startswith("/admin/payment/") and path.endswith("/delete"):
+            return self.delete_payment(path.split("/")[3])
         if path.startswith("/admin/") and path.endswith("/toggle-admin-paid") and path.split("/")[2] in ("utility", "charge"):
             return self.toggle_admin_paid(path.split("/")[2], path.split("/")[3], fields)
         if path == "/admin/utility":
@@ -1701,6 +1743,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             now_iso(),
         )
         if parsed_id:
+            saved_id = parsed_id
             execute(
                 """
                 UPDATE tenancies
@@ -1711,7 +1754,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 values + (parsed_id,),
             )
         else:
-            execute(
+            saved_id = execute(
                 """
                 INSERT INTO tenancies
                 (user_id, label, start_date, end_date, start_electricity, end_electricity, start_gas, end_gas, notes, created_at, updated_at)
@@ -1719,6 +1762,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
                 """,
                 values[:-1] + (now_iso(), now_iso()),
             )
+        ensure_recurring_rent(reprice_tenancy_id=saved_id)
         flash_redirect(self, "/admin/tenancies", "Tenancy saved.")
 
     def delete_tenancy(self, tenancy_id: str) -> None:
@@ -1813,8 +1857,9 @@ class ChirieHandler(BaseHTTPRequestHandler):
                     <li>Rent is generated from this rule, so you do not need to add it every month or backfill it manually.</li>
                     <li>When you save settings, missing rent entries are created for every month in each tenancy period.</li>
                     <li>The due date is clamped safely for shorter months.</li>
+                    <li>Move-in and move-out months are charged by day, and are never due before the move-in date.</li>
                     <li>Existing paid rent records stay untouched for history.</li>
-                    <li>If an unpaid generated rent exists, saving settings updates its amount and due date.</li>
+                    <li>Unpaid rent for this month and later is updated to the new amount and due date; past months keep their original amount.</li>
                 </ul>
             </div>
         </section>
@@ -2022,7 +2067,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             execute("UPDATE utility_entries SET paid = 0, paid_at = NULL, updated_at = ? WHERE id = ?", (now_iso(), parsed_entry_id))
             sync_paid_flag("utility", parsed_entry_id)
             if payment_state("utility", parsed_entry_id, row["bill_amount"], 0)["is_paid"]:
-                return flash_redirect(self, "/dashboard", "Recorded payments still cover this bill, so it stays paid. Adjust its payments to reopen it.", "error")
+                return flash_redirect(self, "/dashboard", "Recorded payments still cover this bill, so it stays paid. Delete its payments on the Payments page to reopen it.", "error")
             return flash_redirect(self, "/dashboard", "Marked unpaid. Recorded partial payments were kept.")
         if state["remaining"] > 0:
             execute(
@@ -2166,7 +2211,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
             execute("UPDATE charges SET paid = 0, paid_at = NULL, updated_at = ? WHERE id = ?", (now_iso(), parsed_charge_id))
             sync_paid_flag("charge", parsed_charge_id)
             if payment_state("charge", parsed_charge_id, row["amount"], 0)["is_paid"]:
-                return flash_redirect(self, "/dashboard", "Recorded payments still cover this charge, so it stays paid. Adjust its payments to reopen it.", "error")
+                return flash_redirect(self, "/dashboard", "Recorded payments still cover this charge, so it stays paid. Delete its payments on the Payments page to reopen it.", "error")
             return flash_redirect(self, "/dashboard", "Marked unpaid. Recorded partial payments were kept.")
         if state["remaining"] > 0:
             execute(
@@ -2231,10 +2276,76 @@ class ChirieHandler(BaseHTTPRequestHandler):
         next_path = fields.get("next") if fields.get("next") in ("/dashboard", "/history") else "/dashboard"
         flash_redirect(self, next_path, "Marked as paid by you." if new_value else "Marked as not paid by you.")
 
+    def payments_page(self) -> None:
+        if not require_admin(self):
+            return
+        payments = query_all(
+            """
+            SELECT payments.*,
+                   COALESCE(utility_entries.month, charges.month) AS month,
+                   COALESCE(utility_entries.tenancy_id, charges.tenancy_id) AS tenancy_id,
+                   utility_entries.utility_type, charges.title
+            FROM payments
+            LEFT JOIN utility_entries ON utility_entries.id = payments.utility_entry_id
+            LEFT JOIN charges ON charges.id = payments.charge_id
+            ORDER BY payments.paid_on DESC, payments.id DESC
+            """
+        )
+        rows = "".join(
+            f"""
+            <tr>
+                <td>{esc(row["paid_on"])}</td>
+                <td>{esc(month_label(row["month"]))}</td>
+                <td>{esc(row["title"] if row["charge_id"] else UTILITY_TYPES.get(row["utility_type"], row["utility_type"]))}</td>
+                <td>{tenancy_badge(row["tenancy_id"])}</td>
+                <td>{money(row["amount"])}</td>
+                <td>{esc(row["notes"] or "")}</td>
+                <td>
+                    <form method="post" action="/admin/payment/{row["id"]}/delete" data-confirm="{esc(f'Delete this payment of {money(row["amount"])}? The bill will show it as owed again.')}">
+                        {csrf_input(self.user)}
+                        <button class="small danger" type="submit">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            """
+            for row in payments
+        )
+        content = f"""
+        {page_header("Payments", "Every recorded payment, newest first. Delete one to correct a mistake.")}
+        <section class="section-block">
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Paid on</th><th>Month</th><th>Bill</th><th>Tenancy</th><th>Amount</th><th>Notes</th><th></th></tr></thead>
+                    <tbody>{rows or '<tr><td colspan="7">No payments yet.</td></tr>'}</tbody>
+                </table>
+            </div>
+        </section>
+        """
+        self.render("Payments", content, active="payments")
+
+    def delete_payment(self, payment_id: str) -> None:
+        if not require_admin(self):
+            return
+        parsed_id = parse_int(payment_id)
+        row = query_one("SELECT * FROM payments WHERE id = ?", (parsed_id,)) if parsed_id is not None else None
+        if not row:
+            return self.not_found()
+        target, row_id = ("utility", row["utility_entry_id"]) if row["utility_entry_id"] else ("charge", row["charge_id"])
+        table = "utility_entries" if target == "utility" else "charges"
+        execute("DELETE FROM payments WHERE id = ?", (parsed_id,))
+        # Clear the stored flag first: with no payments left, payment_total would otherwise trust it.
+        execute(f"UPDATE {table} SET paid = 0 WHERE id = ?", (row_id,))
+        sync_paid_flag(target, row_id)
+        flash_redirect(self, "/admin/payments", f"Payment of {money(row['amount'])} deleted.")
+
     def lump_payment_page(self, query: dict[str, list[str]]) -> None:
         if not require_admin(self):
             return
         tenancy_id = parse_int((query.get("tenancy_id") or [""])[-1])
+        if tenancy_id is None:
+            # Default to today's tenant so money never lands on a previous tenant's old bills.
+            active = active_tenancy_for_date(today()) or query_one("SELECT id FROM tenancies ORDER BY start_date DESC, id DESC LIMIT 1")
+            tenancy_id = int(active["id"]) if active else None
         raw_amount = (query.get("amount") or [""])[-1]
         amount = parse_float(raw_amount, 0)
         paid_on = (query.get("paid_on") or [today()])[-1] or today()
@@ -2277,7 +2388,7 @@ class ChirieHandler(BaseHTTPRequestHandler):
         {page_header("Lump payment", "Split one tenant payment across open bills, oldest first.")}
         <form class="panel wide-form" method="get" action="/admin/lump-payment">
             <div class="form-grid">
-                <label>Tenant period<select name="tenancy_id"><option value="">All tenancies</option>{tenancy_options(tenancy_id or "", include_unassigned=False)}</select></label>
+                <label>Tenant period<select name="tenancy_id">{tenancy_options(tenancy_id or "", include_unassigned=False)}</select></label>
                 <label>Amount received (RON)<input name="amount" inputmode="decimal" value="{esc(raw_amount)}" required></label>
                 <label>Paid on<input name="paid_on" type="date" value="{esc(paid_on)}"></label>
             </div>
